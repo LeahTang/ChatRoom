@@ -1,147 +1,175 @@
-const socket = io();
-
-// Global variables
-let roomId = '';
+let socket = io();
 let localStream;
-let isMuted = false; // Local mute state
+let teams = {}; // Will hold state for each joined team
+let localName = { value: '' }; // Stores the user's name
+let isMuted = false; // Global mute state
 
-// UI Elements
+// Get DOM elements
 const roomModal = document.getElementById('roomModal');
 const roomInput = document.getElementById('roomInput');
 const nameInput = document.getElementById('nameInput');
 const joinRoomBtn = document.getElementById('joinRoomBtn');
 const mainApp = document.getElementById('mainApp');
-const localAudioContainer = document.getElementById('localAudioContainer');
-const remoteAudios = document.getElementById('remoteAudios');
-const participantsDiv = document.getElementById('participants');
-const muteToggleBtn = document.getElementById('muteToggle');
+const teamsContainer = document.getElementById('teamsContainer');
+const joinAnotherTeamBtn = document.getElementById('joinAnotherTeamBtn');
 
-// Object to track peer connections (keyed by peerId)
-const peers = {};
-
-// When a participant list update is received
-socket.on('update-participants', participantList => {
-  console.log('Received participant list: ', participantList);
-  updateParticipantList(participantList);
-});
-
-// When a new user connects, create a peer connection using the current roomId.
-socket.on('user-connected', userId => {
-  console.log('User connected:', userId);
-  // Pass the current roomId, userId as peerId, and localStream.
-  createPeerConnection(roomId, userId, localStream, true);
-});
-
-// When receiving signaling messages
-socket.on('signal', async data => {
-  const { caller, signal } = data;
-  // Since this is a single-team app, we use the global roomId.
-  if (!peers[caller]) {
-    // Ensure local stream is available (it should be already)
-    createPeerConnection(roomId, caller, localStream, false);
-  }
-  if (signal.type === 'offer') {
-    await peers[caller].setRemoteDescription(signal);
-    const answer = await peers[caller].createAnswer();
-    await peers[caller].setLocalDescription(answer);
-    socket.emit('signal', { target: caller, caller: socket.id, signal: peers[caller].localDescription });
-  } else if (signal.type === 'answer') {
-    await peers[caller].setRemoteDescription(signal);
-  } else if (signal.candidate) {
-    try {
-      await peers[caller].addIceCandidate(signal);
-    } catch (err) {
-      console.error('Error adding ICE candidate', err);
-    }
-  }
-});
-
-// Handler for Join Room button
-joinRoomBtn.addEventListener('click', () => {
-  const enteredName = nameInput.value.trim();
-  const enteredRoom = roomInput.value.trim();
-  if (enteredName && enteredRoom) {
-    roomId = enteredRoom;
-    socket.emit('join-room', { roomId, name: enteredName });
-    roomModal.classList.add('hidden');
-    mainApp.classList.remove('hidden');
-    // Start audio and ensure localStream is available
-    startAudio();
-  }
-});
-
-// Function to start audio and set up local stream
-function startAudio() {
-  navigator.mediaDevices.getUserMedia({ 
-      audio: {
-    echoCancellation: false,
-    noiseSuppression: false
-  }
-   })
+// Initialize local audio once
+function initLocalAudio() {
+  if (!localStream) {
+    navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false }
+    })
     .then(stream => {
       localStream = stream;
-      const localAudio = document.createElement('audio');
-      localAudio.controls = false;
-      localAudio.muted = true; // Mute local playback to prevent echo
-      localAudio.autoplay = true;
-      localAudio.srcObject = stream;
-      localAudioContainer.appendChild(localAudio);
-      alert("Your microphone is active; speak and listen to other participants.");
+      alert("Your microphone is active; speak and listen to participants.");
     })
     .catch(error => {
       console.error('Error accessing audio devices:', error);
     });
+  }
 }
 
-// Function to update the participant list UI
-function updateParticipantList(list) {
-  participantsDiv.innerHTML = ''; // Clear the list
-  list.forEach(participant => {
-    const participantElem = document.createElement('div');
-    participantElem.className = 'p-2 bg-white rounded shadow';
-    participantElem.textContent = `${participant.name} - ${participant.muted ? 'Muted' : 'Unmuted'}`;
-    participantsDiv.appendChild(participantElem);
+function localReset() {
+  if (localStream) {
+    localStream.getTracks().forEach(track => track.stop());
+    localStream = null;
+  }
+  isMuted = false;
+  teams = {};
+  socket = io();
+}
+
+// Join a team (room)
+function joinTeam(teamId, name) {
+  if (teams[teamId]) {
+    alert("You have already joined team " + teamId);
+    return;
+  }
+  
+  // Save team state
+  teams[teamId] = { teamId, peers: {}, participants: [] };
+  
+  // Create UI for this team
+  const teamSection = document.createElement('div');
+  teamSection.id = `team-${teamId}`;
+  teamSection.className = 'bg-white p-4 rounded shadow mb-4';
+  teamSection.innerHTML = `
+    <h3 class="text-xl font-bold mb-2">Team: ${teamId}</h3>
+    <button id="ExitToggle-${teamId}" class="px-4 py-2 bg-blue-500 hover:bg-blue-600 text-white rounded shadow">
+      Leave Team
+    </button>
+    <div class="participants mb-2"><strong>Participants:</strong>
+      <div id="participants-${teamId}"></div>
+    </div>
+    <div class="remoteAudios mb-2">
+      <div id="remoteAudios-${teamId}"></div>
+    </div>
+    <button id="muteToggle-${teamId}" class="px-4 py-2 bg-blue-500 hover:bg-blue-600 text-white rounded shadow">
+      Mute
+    </button>
+  `;
+  teamsContainer.appendChild(teamSection);
+
+  let userName = document.getElementById('user-name');
+  userName.textContent = name;
+  
+  // Emit join event for the team
+  socket.emit('join-room', { roomId: teamId, name });
+  
+  // Setup mute toggle for this team
+  const muteToggleBtn = document.getElementById(`muteToggle-${teamId}`);
+  muteToggleBtn.addEventListener('click', () => {
+    isMuted = !isMuted;
+    if (localStream) {
+      localStream.getAudioTracks().forEach(track => {
+        track.enabled = !isMuted;
+      });
+    }
+    muteToggleBtn.textContent = isMuted ? 'Unmute' : 'Mute';
+    socket.emit('mute-status-changed', { roomId: teamId, muted: isMuted });
+  });
+
+  // Setup exit button for this team
+  const exitToggleBtn = document.getElementById(`ExitToggle-${teamId}`);
+  exitToggleBtn.addEventListener('click', () => {
+    // Close all peer connections for this team
+    for (const peerId in teams[teamId].peers) {
+      teams[teamId].peers[peerId].close();
+    }
+    // Remove the team section from the UI
+    teamSection.remove();
+    
+    // Delete the team state
+    delete teams[teamId];
+
+    if (Object.entries(teams).length === 0) {
+      socket.close();
+      localReset();
+      roomModal.classList.remove('hidden');
+      mainApp.classList.add('hidden');
+    } else {
+      // Emit leave event for the team
+      socket.emit('room-leave', teamId);
+    }
+
   });
 }
 
-
-// Toggle mute and notify the server
-muteToggleBtn.addEventListener('click', () => {
-  isMuted = !isMuted;
-  if (localStream) {
-    localStream.getAudioTracks().forEach(track => {
-      // Use track.enabled instead of track.muted
-      track.enabled = !isMuted;
-    });
+// Handler for initial join button in modal
+joinRoomBtn.addEventListener('click', () => {
+  const enteredName = nameInput.value.trim();
+  const enteredRoom = roomInput.value.trim();
+  if (enteredName && enteredRoom) {
+    localName.value = enteredName;
+    initLocalAudio();
+    joinTeam(enteredRoom, enteredName);
+    roomModal.classList.add('hidden');
+    mainApp.classList.remove('hidden');
   }
-  muteToggleBtn.textContent = isMuted ? 'Unmute' : 'Mute';
-  socket.emit('mute-status-changed', { roomId, muted: isMuted });
 });
 
+// Handler for joining another team
+joinAnotherTeamBtn.addEventListener('click', () => {
+  // Clear previous room input
+  roomInput.value = '';
+  // Show modal again (the name is preserved)
+  roomModal.classList.remove('hidden');
+});
 
+// Update the participant list for a team
+function updateParticipantList(teamId, participantList) {
+  const container = document.getElementById(`participants-${teamId}`);
+  if (container) {
+    container.innerHTML = '';
+    participantList.forEach(participant => {
+      const elem = document.createElement('div');
+      elem.textContent = `${participant.name} - ${participant.muted ? 'Muted' : 'Unmuted'}`;
+      container.appendChild(elem);
+    });
+  }
+}
 
-// Function to create and configure a peer connection
+// Create and configure a peer connection for a given team
 function createPeerConnection(teamId, peerId, stream, isInitiator) {
-
-  if (peers[peerId]) {
-    console.log("Peer connection already exists for:", peerId);
-    return peers[peerId];
+  if (!teams[teamId]) return;
+  if (teams[teamId].peers[peerId]) {
+    console.log("Peer connection already exists for:", peerId, "in team", teamId);
+    return teams[teamId].peers[peerId];
   }
   
-  console.log(`Creating RTCPeerConnection for team: ${teamId}, peer: ${peerId}, initiator: ${isInitiator}`);
+  console.log(`Creating RTCPeerConnection for team ${teamId}, peer ${peerId}`);
   const configuration = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
   const peerConnection = new RTCPeerConnection(configuration);
-
+  
   // Add local audio tracks
   if (stream) {
     stream.getTracks().forEach(track => {
-      console.log("Adding track to connection:", track);
       peerConnection.addTrack(track, stream);
     });
   } else {
-    console.error("No local stream available when creating peer connection!");
+    console.error("No local stream available for team:", teamId);
   }
-
+  
   // Handle ICE candidates
   peerConnection.onicecandidate = event => {
     if (event.candidate) {
@@ -153,39 +181,97 @@ function createPeerConnection(teamId, peerId, stream, isInitiator) {
       });
     }
   };
-
-  // Handle remote track: attach to remote audio element
+  
+  // Handle remote tracks
   peerConnection.ontrack = event => {
-    console.log("Received remote track from:", peerId, "team:", teamId);
-    // Create (or use existing) remote audio element
-    let remoteAudio = document.getElementById(`audio-${peerId}`);
+    console.log("Received remote track from:", peerId, "in team:", teamId);
+    const remoteAudiosContainer = document.getElementById(`remoteAudios-${teamId}`);
+    let remoteAudio = document.getElementById(`audio-${teamId}-${peerId}`);
     if (!remoteAudio) {
       remoteAudio = document.createElement('audio');
-      remoteAudio.id = `audio-${peerId}`;
-      remoteAudio.controls = false;
+      remoteAudio.id = `audio-${teamId}-${peerId}`;
       remoteAudio.autoplay = true;
-      remoteAudios.appendChild(remoteAudio);
+      remoteAudiosContainer.appendChild(remoteAudio);
     }
     remoteAudio.srcObject = event.streams[0];
   };
-
-  // Save connection
-  peers[peerId] = peerConnection;
-
+  
+  teams[teamId].peers[peerId] = peerConnection;
+  
   if (isInitiator) {
-    peerConnection.createOffer()
-      .then(offer => {
-        console.log("Created offer for peer:", peerId);
-        return peerConnection.setLocalDescription(offer);
-      })
-      .then(() => {
-        socket.emit('signal', {
-          teamId,
-          target: peerId,
-          caller: socket.id,
-          signal: peerConnection.localDescription
-        });
-      })
-      .catch(error => console.error('Error creating offer:', error));
+    // Delay the offer slightly to ensure both sides have added their tracks
+    setTimeout(() => {
+      peerConnection.createOffer()
+        .then(offer => peerConnection.setLocalDescription(offer))
+        .then(() => {
+          socket.emit('signal', {
+            teamId,
+            target: peerId,
+            caller: socket.id,
+            signal: peerConnection.localDescription
+          });
+        })
+        .catch(error => console.error('Error creating offer:', error));
+    }, 500);
   }
+  
+  return peerConnection;
 }
+
+// Socket event: update participants list
+socket.on('update-participants', data => {
+  // Expect data as { roomId, participants }
+  const { roomId, participants } = data;
+  console.log('Participant update for team', roomId, participants);
+  updateParticipantList(roomId, participants);
+});
+
+// Socket event: new user connected
+socket.on('user-connected', data => {
+  // Expect data as { teamId, userId }
+  const { teamId, userId } = data;
+  console.log('User connected to team', teamId, ':', userId);
+  createPeerConnection(teamId, userId, localStream, true);
+});
+
+// Socket event: signaling message
+socket.on('signal', async data => {
+  const { teamId, caller, signal } = data;
+  if (!teams[teamId]) return;
+  if (!teams[teamId].peers[caller]) {
+    createPeerConnection(teamId, caller, localStream, false);
+  }
+  const peerConnection = teams[teamId].peers[caller];
+  if (signal.type === 'offer') {
+    await peerConnection.setRemoteDescription(signal);
+    const answer = await peerConnection.createAnswer();
+    await peerConnection.setLocalDescription(answer);
+    socket.emit('signal', {
+      teamId,
+      target: caller,
+      caller: socket.id,
+      signal: peerConnection.localDescription
+    });
+  } else if (signal.type === 'answer') {
+    await peerConnection.setRemoteDescription(signal);
+  } else if (signal.candidate) {
+    try {
+      await peerConnection.addIceCandidate(signal);
+    } catch (err) {
+      console.error('Error adding ICE candidate', err);
+    }
+  }
+});
+
+// Socket event: user disconnected
+socket.on('user-disconnected', data => {
+  // Expect data as { teamId, userId }
+  const { teamId, userId } = data;
+  console.log('User disconnected from team', teamId, ':', userId);
+  if (teams[teamId] && teams[teamId].peers[userId]) {
+    teams[teamId].peers[userId].close();
+    delete teams[teamId].peers[userId];
+    const remoteAudio = document.getElementById(`audio-${teamId}-${userId}`);
+    if (remoteAudio) remoteAudio.remove();
+  }
+});
